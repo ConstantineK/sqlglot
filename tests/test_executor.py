@@ -6,8 +6,8 @@ from pandas.testing import assert_frame_equal
 
 from sqlglot import exp, parse_one
 from sqlglot.executor import execute
-from tests.helpers import load_sql_fixture_pairs, FIXTURES_DIR, TPCH_SCHEMA
-
+from sqlglot.executor.python import Python
+from tests.helpers import FIXTURES_DIR, TPCH_SCHEMA, load_sql_fixture_pairs
 
 DIR = FIXTURES_DIR + "/optimizer/tpc-h/"
 
@@ -45,6 +45,9 @@ class TestExecutor(unittest.TestCase):
         for i, column in enumerate(source.columns):
             if "_col_" in column:
                 source.rename(columns={column: target.columns[i]}, inplace=True)
+
+    def test_py_dialect(self):
+        self.assertEqual(Python().generate(parse_one("'x '''")), r"'x \''")
 
     def test_optimized_tpch(self):
         for sql, optimized in self.sqls[0:20]:

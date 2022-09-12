@@ -5,10 +5,9 @@ from collections import deque
 from decimal import Decimal
 
 from sqlglot import exp
-from sqlglot.helper import while_changing
 from sqlglot.expressions import FALSE, NULL, TRUE
 from sqlglot.generator import Generator
-
+from sqlglot.helper import while_changing
 
 GENERATOR = Generator(normalize=True, identify=True)
 
@@ -231,6 +230,13 @@ def simplify_literals(expression):
             return functools.reduce(
                 lambda a, b: expression.__class__(this=a, expression=b), operands
             )
+    elif isinstance(expression, exp.Neg):
+        this = expression.this
+        if this.is_number:
+            value = this.name
+            if value[0] == "-":
+                return exp.Literal.number(value[1:])
+            return exp.Literal.number(f"-{value}")
 
     return expression
 
@@ -255,7 +261,7 @@ def _simplify_binary(expression, a, b):
     if isinstance(expression, exp.EQ) and a == b:
         return TRUE
 
-    if is_number(a) and is_number(b):
+    if a.is_number and b.is_number:
         a = int(a.name) if a.is_int else Decimal(a.name)
         b = int(b.name) if b.is_int else Decimal(b.name)
 
@@ -274,7 +280,7 @@ def _simplify_binary(expression, a, b):
 
         if boolean:
             return boolean
-    elif is_string(a) and is_string(b):
+    elif a.is_string and b.is_string:
         boolean = eval_boolean(expression, a, b)
 
         if boolean:
@@ -325,14 +331,6 @@ def always_true(expression):
 
 def is_complement(a, b):
     return isinstance(b, exp.Not) and b.this == a
-
-
-def is_number(expression):
-    return isinstance(expression, exp.Literal) and not expression.is_string
-
-
-def is_string(expression):
-    return isinstance(expression, exp.Literal) and expression.is_string
 
 
 def eval_boolean(expression, a, b):

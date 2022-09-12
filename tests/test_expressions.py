@@ -27,7 +27,7 @@ class TestExpressions(unittest.TestCase):
             parse_one("ROW() OVER (partition BY y)"),
         )
         self.assertEqual(
-            parse_one("TO_DATE(x)", read="hive"), parse_one("ts_or_ds_to_date_str(x)")
+            parse_one("TO_DATE(x)", read="hive"), parse_one("ts_or_ds_to_date(x)")
         )
 
     def test_find(self):
@@ -329,14 +329,14 @@ class TestExpressions(unittest.TestCase):
         self.assertIsInstance(parse_one("STDDEV_POP(a)"), exp.StddevPop)
         self.assertIsInstance(parse_one("STDDEV_SAMP(a)"), exp.StddevSamp)
         self.assertIsInstance(parse_one("TIME_TO_STR(a, 'format')"), exp.TimeToStr)
-        self.assertIsInstance(parse_one("TIME_TO_TIME_STR(a)"), exp.TimeToTimeStr)
+        self.assertIsInstance(parse_one("TIME_TO_TIME_STR(a)"), exp.Cast)
         self.assertIsInstance(parse_one("TIME_TO_UNIX(a)"), exp.TimeToUnix)
         self.assertIsInstance(parse_one("TIME_STR_TO_DATE(a)"), exp.TimeStrToDate)
         self.assertIsInstance(parse_one("TIME_STR_TO_TIME(a)"), exp.TimeStrToTime)
         self.assertIsInstance(parse_one("TIME_STR_TO_UNIX(a)"), exp.TimeStrToUnix)
         self.assertIsInstance(parse_one("TS_OR_DS_ADD(a, 1, 'day')"), exp.TsOrDsAdd)
         self.assertIsInstance(parse_one("TS_OR_DS_TO_DATE(a)"), exp.TsOrDsToDate)
-        self.assertIsInstance(parse_one("TS_OR_DS_TO_DATE_STR(a)"), exp.TsOrDsToDateStr)
+        self.assertIsInstance(parse_one("TS_OR_DS_TO_DATE_STR(a)"), exp.Substring)
         self.assertIsInstance(parse_one("UNIX_TO_STR(a, 'format')"), exp.UnixToStr)
         self.assertIsInstance(parse_one("UNIX_TO_TIME(a)"), exp.UnixToTime)
         self.assertIsInstance(parse_one("UNIX_TO_TIME_STR(a)"), exp.UnixToTimeStr)
@@ -399,3 +399,18 @@ class TestExpressions(unittest.TestCase):
         self.assertIsNotNone(unit.find(exp.CurrentTimestamp))
         week = unit.find(exp.Week)
         self.assertEqual(week.this, exp.Var(this="thursday"))
+
+    def test_identifier(self):
+        self.assertTrue(exp.to_identifier('"x"').quoted)
+        self.assertFalse(exp.to_identifier("x").quoted)
+
+    def test_function_normalizer(self):
+        self.assertEqual(
+            parse_one("HELLO()").sql(normalize_functions="lower"), "hello()"
+        )
+        self.assertEqual(
+            parse_one("hello()").sql(normalize_functions="upper"), "HELLO()"
+        )
+        self.assertEqual(parse_one("heLLO()").sql(normalize_functions=None), "heLLO()")
+        self.assertEqual(parse_one("SUM(x)").sql(normalize_functions="lower"), "sum(x)")
+        self.assertEqual(parse_one("sum(x)").sql(normalize_functions="upper"), "SUM(x)")

@@ -3,8 +3,12 @@ import unittest
 from unittest import mock
 
 from sqlglot import parse_one, transpile
-from sqlglot.errors import ErrorLevel, ParseError
-from tests.helpers import load_sql_fixtures, load_sql_fixture_pairs
+from sqlglot.errors import ErrorLevel, ParseError, UnsupportedError
+from tests.helpers import (
+    assert_logger_contains,
+    load_sql_fixture_pairs,
+    load_sql_fixtures,
+)
 
 
 class TestTranspile(unittest.TestCase):
@@ -169,16 +173,18 @@ class TestTranspile(unittest.TestCase):
         )
 
         self.validate(
-            "STR_TO_TIME(x, 'y')", "FROM_UNIXTIME(UNIX_TIMESTAMP(x, 'y'))", write="hive"
+            "STR_TO_TIME(x, 'y')",
+            "CAST(FROM_UNIXTIME(UNIX_TIMESTAMP(x, 'y')) AS TIMESTAMP)",
+            write="hive",
         )
         self.validate(
             "STR_TO_TIME(x, 'yyyy-MM-dd HH:mm:ss')",
-            "DATE_FORMAT(x, 'yyyy-MM-dd HH:mm:ss')",
+            "CAST(x AS TIMESTAMP)",
             write="hive",
         )
         self.validate(
             "STR_TO_TIME(x, 'yyyy-MM-dd')",
-            "DATE_FORMAT(x, 'yyyy-MM-dd HH:mm:ss')",
+            "CAST(x AS TIMESTAMP)",
             write="hive",
         )
 
@@ -191,7 +197,7 @@ class TestTranspile(unittest.TestCase):
 
         self.validate("TIME_STR_TO_TIME(x)", "TIME_STR_TO_TIME(x)", write=None)
         self.validate("TIME_STR_TO_UNIX(x)", "TIME_STR_TO_UNIX(x)", write=None)
-        self.validate("TIME_TO_TIME_STR(x)", "TIME_TO_TIME_STR(x)", write=None)
+        self.validate("TIME_TO_TIME_STR(x)", "CAST(x AS TEXT)", write=None)
         self.validate("TIME_TO_STR(x, 'y')", "TIME_TO_STR(x, 'y')", write=None)
         self.validate("TIME_TO_UNIX(x)", "TIME_TO_UNIX(x)", write=None)
         self.validate("UNIX_TO_STR(x, 'y')", "UNIX_TO_STR(x, 'y')", write=None)
@@ -287,11 +293,54 @@ class TestTranspile(unittest.TestCase):
 
     @mock.patch("sqlglot.parser.logger")
     def test_error_level(self, logger):
-        transpile("x + 1 (", error_level=ErrorLevel.WARN)
-        assert (
-            "Required keyword: 'expressions' missing for <class 'sqlglot.expressions.Aliases'>. Line 1, Col: 7.\n  x + 1 \033[4m(\033[0m"
-            in str(logger.error.call_args_list[0][0][0])
-        )
+        invalid = "x + 1. ("
+        errors = [
+            "Required keyword: 'expressions' missing for <class 'sqlglot.expressions.Aliases'>. Line 1, Col: 8.\n  x + 1. \033[4m(\033[0m",
+            "Expecting ). Line 1, Col: 8.\n  x + 1. \033[4m(\033[0m",
+        ]
 
-        with self.assertRaises(ParseError):
-            transpile("x + 1 (")
+        transpile(invalid, error_level=ErrorLevel.WARN)
+        for error in errors:
+            assert_logger_contains(error, logger)
+
+        with self.assertRaises(ParseError) as ctx:
+            transpile(invalid, error_level=ErrorLevel.IMMEDIATE)
+        self.assertEqual(str(ctx.exception), errors[0])
+
+        with self.assertRaises(ParseError) as ctx:
+            transpile(invalid, error_level=ErrorLevel.RAISE)
+        self.assertEqual(str(ctx.exception), "\n\n".join(errors))
+
+        more_than_max_errors = "(((("
+        expected = (
+            "Expecting ). Line 1, Col: 4.\n  (((\033[4m(\033[0m\n\n"
+            "Required keyword: 'this' missing for <class 'sqlglot.expressions.Paren'>. Line 1, Col: 4.\n  (((\033[4m(\033[0m\n\n"
+            "Expecting ). Line 1, Col: 4.\n  (((\033[4m(\033[0m\n\n"
+            "... and 2 more"
+        )
+        with self.assertRaises(ParseError) as ctx:
+            transpile(more_than_max_errors, error_level=ErrorLevel.RAISE)
+        self.assertEqual(str(ctx.exception), expected)
+
+    @mock.patch("sqlglot.generator.logger")
+    def test_unsupported_level(self, logger):
+        def unsupported(level):
+            transpile(
+                "SELECT MAP(a, b), MAP(a, b), MAP(a, b), MAP(a, b)",
+                read="presto",
+                write="hive",
+                unsupported_level=level,
+            )
+
+        error = "Cannot convert array columns into map use SparkSQL instead."
+
+        unsupported(ErrorLevel.WARN)
+        assert_logger_contains("\n".join([error] * 4), logger, level="warning")
+
+        with self.assertRaises(UnsupportedError) as ctx:
+            unsupported(ErrorLevel.RAISE)
+        self.assertEqual(str(ctx.exception).count(error), 3)
+
+        with self.assertRaises(UnsupportedError) as ctx:
+            unsupported(ErrorLevel.IMMEDIATE)
+        self.assertEqual(str(ctx.exception).count(error), 1)

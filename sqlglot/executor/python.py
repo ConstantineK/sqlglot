@@ -3,12 +3,13 @@ import collections
 import itertools
 
 from sqlglot import exp, planner
-from sqlglot.dialects import Dialect
+from sqlglot.dialects.dialect import Dialect, inline_array_sql
 from sqlglot.executor.context import Context
 from sqlglot.executor.env import ENV
 from sqlglot.executor.table import Table
 from sqlglot.generator import Generator
 from sqlglot.helper import csv_reader
+from sqlglot.tokens import Tokenizer
 
 
 class PythonExecutor:
@@ -121,7 +122,6 @@ class PythonExecutor:
         return self.context({step.name: sink})
 
     def scan_csv(self, step):
-        # pylint: disable=stop-iteration-return
         source = step.source
         alias = source.alias
 
@@ -288,7 +288,6 @@ class PythonExecutor:
         return self.scan(step, context)
 
 
-# pylint: disable=no-member
 def _cast_py(self, expression):
     to = expression.args["to"].this
     this = self.sql(expression, "this")
@@ -327,9 +326,13 @@ def _ordered_py(self, expression):
 
 
 class Python(Dialect):
+    class Tokenizer(Tokenizer):
+        ESCAPE = "\\"
+
     class Generator(Generator):
         TRANSFORMS = {
             exp.Alias: lambda self, e: self.sql(e.this),
+            exp.Array: inline_array_sql,
             exp.And: lambda self, e: self.binary(e, "and"),
             exp.Cast: _cast_py,
             exp.Column: _column_py,
@@ -343,3 +346,15 @@ class Python(Dialect):
             exp.Ordered: _ordered_py,
             exp.Star: lambda *_: "1",
         }
+
+        def case_sql(self, expression):
+            this = self.sql(expression, "this")
+            chain = self.sql(expression, "default") or "None"
+
+            for e in reversed(expression.args["ifs"]):
+                true = self.sql(e, "true")
+                condition = self.sql(e, "this")
+                condition = f"{this} = ({condition})" if this else condition
+                chain = f"{true} if {condition} else ({chain})"
+
+            return chain

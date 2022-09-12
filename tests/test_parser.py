@@ -1,8 +1,9 @@
 import unittest
 from unittest.mock import patch
 
-from sqlglot import parse, parse_one, exp, Parser
+from sqlglot import Parser, exp, parse, parse_one
 from sqlglot.errors import ErrorLevel, ParseError
+from tests.helpers import assert_logger_contains
 
 
 class TestParser(unittest.TestCase):
@@ -31,6 +32,9 @@ class TestParser(unittest.TestCase):
     def test_select(self):
         self.assertIsNotNone(
             parse_one("select * from (select 1) x order by x.y").args["order"]
+        )
+        self.assertIsNotNone(
+            parse_one("select * from x where a = (select 1) order by x.y").args["order"]
         )
         self.assertEqual(
             len(parse_one("select * from (select 1) x cross join y").args["joins"]), 1
@@ -89,7 +93,7 @@ class TestParser(unittest.TestCase):
 
         warn = Parser(error_level=ErrorLevel.WARN)
         warn.expression(exp.Hint, y="")
-        assert isinstance(warn.errors[0], ParseError)
+        self.assertEqual(len(warn.errors), 2)
 
     def test_parse_errors(self):
         with self.assertRaises(ParseError):
@@ -103,10 +107,16 @@ class TestParser(unittest.TestCase):
 
     def test_space(self):
         self.assertEqual(
-            parse_one(
-                "SELECT ROW() OVER(PARTITION  BY x) FROM x GROUP  BY y", ""
-            ).sql(),
+            parse_one("SELECT ROW() OVER(PARTITION  BY x) FROM x GROUP  BY y").sql(),
             "SELECT ROW() OVER (PARTITION BY x) FROM x GROUP BY y",
+        )
+
+        self.assertEqual(
+            parse_one(
+                """SELECT   * FROM x GROUP
+                BY y"""
+            ).sql(),
+            "SELECT * FROM x GROUP BY y",
         )
 
     def test_missing_by(self):
@@ -120,17 +130,19 @@ class TestParser(unittest.TestCase):
                 a #annotation1,
                 b as B #annotation2:testing ,
                 "test#annotation",c#annotation3, d #annotation4,
-                e #
+                e #,
+                f # space
             FROM foo
         """
         )
 
-        assert expression.expressions[0].text("this") == "annotation1"
-        assert expression.expressions[1].text("this") == "annotation2:testing"
-        assert expression.expressions[2].text("this") == "test#annotation"
-        assert expression.expressions[3].text("this") == "c#annotation3"
-        assert expression.expressions[4].text("this") == "annotation4"
-        assert expression.expressions[5].text("this") == ""
+        assert expression.expressions[0].name == "annotation1"
+        assert expression.expressions[1].name == "annotation2:testing "
+        assert expression.expressions[2].name == "test#annotation"
+        assert expression.expressions[3].name == "annotation3"
+        assert expression.expressions[4].name == "annotation4"
+        assert expression.expressions[5].name == ""
+        assert expression.expressions[6].name == " space"
 
     def test_pretty_config_override(self):
         self.assertEqual(parse_one("SELECT col FROM x").sql(), "SELECT col FROM x")
@@ -141,4 +153,43 @@ class TestParser(unittest.TestCase):
 
         self.assertEqual(
             parse_one("SELECT col FROM x").sql(pretty=True), "SELECT\n  col\nFROM x"
+        )
+
+    @patch("sqlglot.parser.logger")
+    def test_comment_error_n(self, logger):
+        parse_one(
+            """CREATE TABLE x
+(
+-- test
+)""",
+            error_level=ErrorLevel.WARN,
+        )
+
+        assert_logger_contains(
+            "Required keyword: 'expressions' missing for <class 'sqlglot.expressions.Schema'>. Line 4, Col: 1.",
+            logger,
+        )
+
+    @patch("sqlglot.parser.logger")
+    def test_comment_error_r(self, logger):
+        parse_one(
+            """CREATE TABLE x (-- test\r)""",
+            error_level=ErrorLevel.WARN,
+        )
+
+        assert_logger_contains(
+            "Required keyword: 'expressions' missing for <class 'sqlglot.expressions.Schema'>. Line 2, Col: 1.",
+            logger,
+        )
+
+    @patch("sqlglot.parser.logger")
+    def test_create_table_error(self, logger):
+        parse_one(
+            """CREATE TABLE PARTITION""",
+            error_level=ErrorLevel.WARN,
+        )
+
+        assert_logger_contains(
+            "Expected table name",
+            logger,
         )

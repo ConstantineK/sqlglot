@@ -3,13 +3,11 @@ import re
 from contextlib import contextmanager
 from enum import Enum
 
-
 CAMEL_CASE_PATTERN = re.compile("(?<!^)(?=[A-Z])")
 logger = logging.getLogger("sqlglot")
 
 
 class AutoName(Enum):
-    # pylint: disable=no-self-argument
     def _generate_next_value_(name, _start, _count, _last_values):
         return name
 
@@ -32,14 +30,12 @@ def csv(*args, sep=", "):
 
 
 def apply_index_offset(expressions, offset):
-    from sqlglot import exp
-
     if not offset or len(expressions) != 1:
         return expressions
 
     expression = expressions[0]
 
-    if isinstance(expression, exp.Literal) and expression.is_int:
+    if expression.is_int:
         expression = expression.copy()
         logger.warning("Applying array index offset (%s)", offset)
         expression.args["this"] = str(int(expression.args["this"]) + offset)

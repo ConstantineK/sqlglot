@@ -1,4 +1,4 @@
-from sqlglot import exp
+from sqlglot import exp, transforms
 from sqlglot.dialects.dialect import (
     Dialect,
     format_time_lambda,
@@ -6,12 +6,14 @@ from sqlglot.dialects.dialect import (
     no_ilike_sql,
     no_safe_divide_sql,
     rename_func,
+    str_position_sql,
     struct_extract_sql,
 )
 from sqlglot.dialects.mysql import MySQL
 from sqlglot.generator import Generator
 from sqlglot.helper import csv, list_get
 from sqlglot.parser import Parser
+from sqlglot.tokens import Tokenizer, TokenType
 
 
 def _approx_distinct_sql(self, expression):
@@ -86,36 +88,37 @@ def _quantile_sql(self, expression):
     return f"APPROX_PERCENTILE({self.sql(expression, 'this')}, {self.sql(expression, 'quantile')})"
 
 
-def _str_position_sql(self, expression):
-    this = self.sql(expression, "this")
-    substr = self.sql(expression, "substr")
-    position = self.sql(expression, "position")
-    if position:
-        return f"STRPOS(SUBSTR({this}, {position}), {substr}) + {position} - 1"
-    return f"STRPOS({this}, {substr})"
-
-
-def _ts_or_ds_to_date_str_sql(self, expression):
-    this = self.sql(expression, "this")
-    return f"DATE_FORMAT(DATE_PARSE(SUBSTR(CAST({this} AS VARCHAR), 1, 10), {Presto.date_format}), {Presto.date_format})"
+def _str_to_time_sql(self, expression):
+    return f"DATE_PARSE({self.sql(expression, 'this')}, {self.format_time(expression)})"
 
 
 def _ts_or_ds_to_date_sql(self, expression):
-    this = self.sql(expression, "this")
-    return f"CAST(DATE_PARSE(SUBSTR(CAST({this} AS VARCHAR), 1, 10), {Presto.date_format}) AS DATE)"
+    time_format = self.format_time(expression)
+    if time_format and time_format not in (Presto.time_format, Presto.date_format):
+        return f"CAST({_str_to_time_sql(self, expression)} AS DATE)"
+    return (
+        f"CAST(SUBSTR(CAST({self.sql(expression, 'this')} AS VARCHAR), 1, 10) AS DATE)"
+    )
 
 
 def _ts_or_ds_add_sql(self, expression):
     this = self.sql(expression, "this")
     e = self.sql(expression, "expression")
     unit = self.sql(expression, "unit") or "'day'"
-    return f"DATE_FORMAT(DATE_ADD({unit}, {e}, DATE_PARSE(SUBSTR({this}, 1, 10), {Presto.date_format})), {Presto.date_format})"
+    return f"DATE_ADD({unit}, {e}, DATE_PARSE(SUBSTR({this}, 1, 10), {Presto.date_format}))"
 
 
 class Presto(Dialect):
     index_offset = 1
+    null_ordering = "nulls_are_last"
     time_format = "'%Y-%m-%d %H:%i:%S'"
     time_mapping = MySQL.time_mapping
+
+    class Tokenizer(Tokenizer):
+        KEYWORDS = {
+            **Tokenizer.KEYWORDS,
+            "ROW": TokenType.STRUCT,
+        }
 
     class Parser(Parser):
         FUNCTIONS = {
@@ -141,16 +144,30 @@ class Presto(Dialect):
         }
 
     class Generator(Generator):
+
+        STRUCT_DELIMITER = ("(", ")")
+
+        WITH_PROPERTIES = [
+            exp.PartitionedByProperty,
+            exp.FileFormatProperty,
+            exp.SchemaCommentProperty,
+            exp.AnonymousProperty,
+            exp.TableFormatProperty,
+        ]
+
         TYPE_MAPPING = {
+            **Generator.TYPE_MAPPING,
             exp.DataType.Type.INT: "INTEGER",
             exp.DataType.Type.FLOAT: "REAL",
             exp.DataType.Type.BINARY: "VARBINARY",
             exp.DataType.Type.TEXT: "VARCHAR",
             exp.DataType.Type.TIMESTAMPTZ: "TIMESTAMP",
+            exp.DataType.Type.STRUCT: "ROW",
         }
 
         TRANSFORMS = {
             **Generator.TRANSFORMS,
+            **transforms.UNALIAS_GROUP,
             exp.ApproxDistinct: _approx_distinct_sql,
             exp.Array: lambda self, e: f"ARRAY[{self.expressions(e, flat=True)}]",
             exp.ArrayContains: rename_func("CONTAINS"),
@@ -166,33 +183,34 @@ class Presto(Dialect):
             exp.DateAdd: lambda self, e: f"""DATE_ADD({self.sql(e, 'unit') or "'day'"}, {self.sql(e, 'expression')}, {self.sql(e, 'this')})""",
             exp.DateDiff: lambda self, e: f"""DATE_DIFF({self.sql(e, 'unit') or "'day'"}, {self.sql(e, 'expression')}, {self.sql(e, 'this')})""",
             exp.DateStrToDate: lambda self, e: f"CAST(DATE_PARSE({self.sql(e, 'this')}, {Presto.date_format}) AS DATE)",
-            exp.DateToDateStr: lambda self, e: f"DATE_FORMAT({self.sql(e, 'this')}, {Presto.date_format})",
             exp.DateToDi: lambda self, e: f"CAST(DATE_FORMAT({self.sql(e, 'this')}, {Presto.dateint_format}) AS INT)",
             exp.DiToDate: lambda self, e: f"CAST(DATE_PARSE(CAST({self.sql(e, 'this')} AS VARCHAR), {Presto.dateint_format}) AS DATE)",
+            exp.FileFormatProperty: lambda self, e: self.property_sql(e),
             exp.If: if_sql,
             exp.ILike: no_ilike_sql,
             exp.Initcap: _initcap_sql,
             exp.Lateral: _explode_to_unnest_sql,
             exp.Levenshtein: rename_func("LEVENSHTEIN_DISTANCE"),
+            exp.PartitionedByProperty: lambda self, e: f"PARTITIONED_BY = {self.sql(e.args['value'])}",
             exp.Quantile: _quantile_sql,
             exp.SafeDivide: no_safe_divide_sql,
             exp.Schema: _schema_sql,
             exp.SortArray: _no_sort_array,
-            exp.StrPosition: _str_position_sql,
-            exp.StrToTime: lambda self, e: f"DATE_PARSE({self.sql(e, 'this')}, {self.format_time(e)})",
+            exp.StrPosition: str_position_sql,
+            exp.StrToDate: lambda self, e: f"CAST({_str_to_time_sql(self, e)} AS DATE)",
+            exp.StrToTime: _str_to_time_sql,
             exp.StrToUnix: lambda self, e: f"TO_UNIXTIME(DATE_PARSE({self.sql(e, 'this')}, {self.format_time(e)}))",
             exp.StructExtract: struct_extract_sql,
+            exp.TableFormatProperty: lambda self, e: f"TABLE_FORMAT = '{e.text('value').upper()}'",
             exp.TimeStrToDate: _date_parse_sql,
             exp.TimeStrToTime: _date_parse_sql,
             exp.TimeStrToUnix: lambda self, e: f"TO_UNIXTIME(DATE_PARSE({self.sql(e, 'this')}, {Presto.time_format}))",
             exp.TimeToStr: lambda self, e: f"DATE_FORMAT({self.sql(e, 'this')}, {self.format_time(e)})",
-            exp.TimeToTimeStr: lambda self, e: f"DATE_FORMAT({self.sql(e, 'this')}, {Presto.time_format})",
             exp.TimeToUnix: rename_func("TO_UNIXTIME"),
             exp.TsOrDiToDi: lambda self, e: f"CAST(SUBSTR(REPLACE(CAST({self.sql(e, 'this')} AS VARCHAR), '-', ''), 1, 8) AS INT)",
             exp.TsOrDsAdd: _ts_or_ds_add_sql,
-            exp.TsOrDsToDateStr: _ts_or_ds_to_date_str_sql,
             exp.TsOrDsToDate: _ts_or_ds_to_date_sql,
             exp.UnixToStr: lambda self, e: f"DATE_FORMAT(FROM_UNIXTIME({self.sql(e, 'this')}), {self.format_time(e)})",
             exp.UnixToTime: rename_func("FROM_UNIXTIME"),
-            exp.UnixToTimeStr: lambda self, e: f"DATE_FORMAT(FROM_UNIXTIME({self.sql(e, 'this')}), {Presto.time_format})",
+            exp.UnixToTimeStr: lambda self, e: f"CAST(FROM_UNIXTIME({self.sql(e, 'this')}) AS VARCHAR)",
         }

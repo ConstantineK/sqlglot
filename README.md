@@ -1,8 +1,8 @@
 # SQLGlot
 
-SQLGlot is a no dependency Python SQL parser, transpiler, and optimizer. It can be used to format SQL or translate between different dialects like [DuckDB](https://duckdb.org/), [Presto](https://prestodb.io/), [Spark](https://spark.apache.org/), and [BigQuery](https://cloud.google.com/bigquery/). It aims to read a wide variety of SQL inputs and output syntatically correct SQL in the targeted dialects.
+SQLGlot is a no dependency Python SQL parser, transpiler, and optimizer. It can be used to format SQL or translate between different dialects like [DuckDB](https://duckdb.org/), [Presto](https://prestodb.io/), [Spark](https://spark.apache.org/), and [BigQuery](https://cloud.google.com/bigquery/). It aims to read a wide variety of SQL inputs and output syntactically correct SQL in the targeted dialects.
 
-It is a very comprehensive generic SQL parser with a robust [test suite](tests). It is also quite [performant](#benchmarks) while being written purely in Python. 
+It is a very comprehensive generic SQL parser with a robust [test suite](tests). It is also quite [performant](#benchmarks) while being written purely in Python.
 
 You can easily [customize](#custom-dialects) the parser, [analyze](#metadata) queries, traverse expression trees, and programmatically [build](#build-and-modify-sql) SQL.
 
@@ -171,7 +171,7 @@ SELECT FUN(a) FROM x
 
 ## SQL Optimizer
 
-SQLGlot can rewrite queries into an "optimized" form. It performs a variety of [techniques](sqlglot/optimizer/optimizer.py) to create a new canonical AST. This AST can be used to standaradize queries or provide the foundations for implementing an actual engine.
+SQLGlot can rewrite queries into an "optimized" form. It performs a variety of [techniques](sqlglot/optimizer/optimizer.py) to create a new canonical AST. This AST can be used to standardize queries or provide the foundations for implementing an actual engine.
 
 ```python
 import sqlglot
@@ -215,6 +215,8 @@ SELECT
   country
 FROM users
 ```
+
+SQL annotations are currently incompatible with MySQL, which uses the `#` character to introduce comments.
 
 ## AST Introspection
 
@@ -271,10 +273,9 @@ from sqlglot.tokens import Tokenizer, TokenType
 
 
 class Custom(Dialect):
-    identifier = "`"
-
     class Tokenizer(Tokenizer):
         QUOTES = ["'", '"']
+        IDENTIFIERS = ["`"]
 
         KEYWORDS = {
             **Tokenizer.KEYWORDS,
@@ -307,16 +308,15 @@ Dialects["custom"]
 
 |           Query |         sqlglot |         sqltree |        sqlparse |  moz_sql_parser |        sqloxide |
 | --------------- | --------------- | --------------- | --------------- | --------------- | --------------- |
-|            tpch |   0.01192 (1.0) | 0.01176 (0.986) | 0.04785 (4.012) | 0.07195 (6.033) | 0.00109 (0.092) |
-|           short |   0.00096 (1.0) | 0.00092 (0.962) | 0.00317 (3.305) | 0.00482 (5.017) | 6.69349 (0.069) |
-|            long |   0.01142 (1.0) | 0.01022 (0.895) | 0.04224 (3.698) | 0.06460 (5.655) | 0.00091 (0.080) |
-|           crazy |   0.04056 (1.0) | 0.03593 (0.885) | 11.1451 (274.7) | 1.01040 (24.91) | 0.00550 (0.135) |
+|            tpch |   0.01178 (1.0) | 0.01173 (0.995) | 0.04676 (3.966) | 0.06800 (5.768) | 0.00094 (0.080) |
+|           short |   0.00084 (1.0) | 0.00079 (0.948) | 0.00296 (3.524) | 0.00443 (5.266) | 0.00006 (0.072) |
+|            long |   0.01102 (1.0) | 0.01044 (0.947) | 0.04349 (3.945) | 0.05998 (5.440) | 0.00084 (0.077) |
+|           crazy |   0.03751 (1.0) | 0.03471 (0.925) | 11.0796 (295.3) | 1.03355 (27.55) | 0.00529 (0.141) |
 
 
 ## Run Tests and Lint
 ```
 pip install -r requirements.txt
-./format_code.sh
 ./run_checks.sh
 ```
 

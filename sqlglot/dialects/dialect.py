@@ -1,3 +1,5 @@
+from enum import Enum
+
 from sqlglot import exp
 from sqlglot.generator import Generator
 from sqlglot.helper import csv, list_get
@@ -5,6 +7,25 @@ from sqlglot.parser import Parser
 from sqlglot.time import format_time
 from sqlglot.tokens import Tokenizer
 from sqlglot.trie import new_trie
+
+
+class Dialects(str, Enum):
+    DIALECT = ""
+
+    BIGQUERY = "bigquery"
+    CLICKHOUSE = "clickhouse"
+    DUCKDB = "duckdb"
+    HIVE = "hive"
+    MYSQL = "mysql"
+    ORACLE = "oracle"
+    POSTGRES = "postgres"
+    PRESTO = "presto"
+    SNOWFLAKE = "snowflake"
+    SPARK = "spark"
+    SQLITE = "sqlite"
+    STARROCKS = "starrocks"
+    TABLEAU = "tableau"
+    TRINO = "trino"
 
 
 class _Dialect(type):
@@ -20,7 +41,8 @@ class _Dialect(type):
 
     def __new__(cls, clsname, bases, attrs):
         klass = super().__new__(cls, clsname, bases, attrs)
-        cls.classes[clsname.lower()] = klass
+        enum = Dialects.__members__.get(clsname.upper())
+        cls.classes[enum.value if enum is not None else clsname.lower()] = klass
 
         klass.time_trie = new_trie(klass.time_mapping)
         klass.inverse_time_mapping = {v: k for k, v in klass.time_mapping.items()}
@@ -30,19 +52,23 @@ class _Dialect(type):
         klass.parser_class = getattr(klass, "Parser", Parser)
         klass.generator_class = getattr(klass, "Generator", Generator)
 
-        klass.tokenizer = klass.tokenizer_class(
-            identifier=klass.identifier,
-            escape=klass.escape,
-        )
+        klass.tokenizer = klass.tokenizer_class()
+        klass.quote_start, klass.quote_end = list(klass.tokenizer_class.QUOTES.items())[
+            0
+        ]
+        klass.identifier_start, klass.identifier_end = list(
+            klass.tokenizer_class.IDENTIFIERS.items()
+        )[0]
+
         return klass
 
 
 class Dialect(metaclass=_Dialect):
-    identifier = None
-    escape = "'"
     index_offset = 0
     unnest_column_only = False
     alias_post_tablesample = False
+    normalize_functions = "upper"
+    null_ordering = "nulls_are_small"
 
     date_format = "'%Y-%m-%d'"
     dateint_format = "'%Y%m%d'"
@@ -50,6 +76,11 @@ class Dialect(metaclass=_Dialect):
     time_mapping = {}
 
     # autofilled
+    quote_start = None
+    quote_end = None
+    identifier_start = None
+    identifier_end = None
+
     time_trie = None
     inverse_time_mapping = None
     inverse_time_trie = None
@@ -77,7 +108,7 @@ class Dialect(metaclass=_Dialect):
                     cls.time_trie,
                 )
             )
-        if isinstance(expression, exp.Literal) and expression.is_string:
+        if expression and expression.is_string:
             return exp.Literal.string(
                 format_time(
                     expression.this,
@@ -102,28 +133,31 @@ class Dialect(metaclass=_Dialect):
         return self.generate(self.parse(code), **opts)
 
     def parser(self, **opts):
-        # pylint: disable=not-callable
         return self.parser_class(
             **{
                 "index_offset": self.index_offset,
                 "unnest_column_only": self.unnest_column_only,
                 "alias_post_tablesample": self.alias_post_tablesample,
+                "null_ordering": self.null_ordering,
                 **opts,
             },
         )
 
     def generator(self, **opts):
-        # pylint: disable=not-callable
         return self.generator_class(
             **{
-                "quote": self.tokenizer_class.QUOTES[0],
-                "identifier": self.identifier,
-                "escape": self.escape,
+                "quote_start": self.quote_start,
+                "quote_end": self.quote_end,
+                "identifier_start": self.identifier_start,
+                "identifier_end": self.identifier_end,
+                "escape": self.tokenizer_class.ESCAPE,
                 "index_offset": self.index_offset,
                 "time_mapping": self.inverse_time_mapping,
                 "time_trie": self.inverse_time_trie,
                 "unnest_column_only": self.unnest_column_only,
                 "alias_post_tablesample": self.alias_post_tablesample,
+                "normalize_functions": self.normalize_functions,
+                "null_ordering": self.null_ordering,
                 **opts,
             }
         )
@@ -148,6 +182,18 @@ def if_sql(self, expression):
         self.sql(expression, "false"),
     )
     return f"IF({expressions})"
+
+
+def arrow_json_extract_sql(self, expression):
+    return f"{self.sql(expression, 'this')}->{self.sql(expression, 'path')}"
+
+
+def arrow_json_extract_scalar_sql(self, expression):
+    return f"{self.sql(expression, 'this')}->>{self.sql(expression, 'path')}"
+
+
+def inline_array_sql(self, expression):
+    return f"[{self.expressions(expression)}]"
 
 
 def no_ilike_sql(self, expression):
@@ -186,18 +232,36 @@ def no_trycast_sql(self, expression):
     return self.cast_sql(expression)
 
 
+def str_position_sql(self, expression):
+    this = self.sql(expression, "this")
+    substr = self.sql(expression, "substr")
+    position = self.sql(expression, "position")
+    if position:
+        return f"STRPOS(SUBSTR({this}, {position}), {substr}) + {position} - 1"
+    return f"STRPOS({this}, {substr})"
+
+
 def struct_extract_sql(self, expression):
     this = self.sql(expression, "this")
-    struct_key = self.sql(expression, "expression").replace(self.quote, self.identifier)
+    struct_key = self.sql(exp.Identifier(this=expression.expression, quoted=True))
     return f"{this}.{struct_key}"
 
 
-def format_time_lambda(exp_class, dialect, default=False):
+def format_time_lambda(exp_class, dialect, default=None):
+    """Helper used for time expressions.
+
+    Args
+        exp_class (Class): the expression class to instantiate
+        dialect (string): sql dialect
+        default (Option[bool | str]): the default format, True being time
+    """
+
     def _format_time(args):
         return exp_class(
             this=list_get(args, 0),
             format=Dialect[dialect].format_time(
-                list_get(args, 1) or (Dialect[dialect].time_format if default else None)
+                list_get(args, 1)
+                or (Dialect[dialect].time_format if default is True else default)
             ),
         )
 

@@ -1,12 +1,12 @@
-from sqlglot import exp, constants as c
+from sqlglot import exp, transforms
 from sqlglot.dialects.dialect import (
     Dialect,
     approx_count_distinct_sql,
     format_time_lambda,
     if_sql,
     no_ilike_sql,
-    no_safe_divide_sql,
     no_recursive_cte_sql,
+    no_safe_divide_sql,
     no_trycast_sql,
     rename_func,
     struct_extract_sql,
@@ -45,44 +45,13 @@ def _map_sql(self, expression):
 
 
 def _array_sort(self, expression):
-    if expression.args.get("expression"):
+    if expression.expression:
         self.unsupported("Hive SORT_ARRAY does not support a comparator")
     return f"SORT_ARRAY({self.sql(expression, 'this')})"
 
 
-def _properties_sql(self, expression):
-    expression = expression.copy()
-    properties = expression.expressions
-
-    using = ""
-    stored_as = ""
-    partitioned_by = ""
-
-    for p in properties:
-        if p.name.upper() == c.TABLE_FORMAT:
-            using = p
-        elif p.name.upper() == c.FILE_FORMAT:
-            stored_as = p
-        elif isinstance(p.args["value"], exp.Schema):
-            partitioned_by = p
-
-    if partitioned_by:
-        properties.remove(partitioned_by)
-        partitioned_by = self.seg(
-            f"PARTITIONED BY {self.sql(partitioned_by.args['value'])}"
-        )
-    if using:
-        properties.remove(using)
-        using = self.seg(f"USING {using.text('value').upper()}")
-    if stored_as:
-        properties.remove(stored_as)
-        stored_as = self.seg(f"STORED AS {stored_as.text('value').upper()}")
-
-    return f"{using}{partitioned_by}{stored_as}{self.properties('TBLPROPERTIES', expression)}"
-
-
 def _property_sql(self, expression):
-    key = expression.text("this")
+    key = expression.name
     value = self.sql(expression, "value")
     return f"'{key}' = {value}"
 
@@ -91,11 +60,20 @@ def _str_to_unix(self, expression):
     return f"UNIX_TIMESTAMP({csv(self.sql(expression, 'this'), _time_format(self, expression))})"
 
 
+def _str_to_date(self, expression):
+    this = self.sql(expression, "this")
+    time_format = self.format_time(expression)
+    if time_format not in (Hive.time_format, Hive.date_format):
+        this = f"FROM_UNIXTIME(UNIX_TIMESTAMP({this}, {time_format}))"
+    return f"CAST({this} AS DATE)"
+
+
 def _str_to_time(self, expression):
-    time_format = self.sql(expression, "format")
-    if time_format in (Hive.time_format, Hive.date_format):
-        return f"DATE_FORMAT({self.sql(expression, 'this')}, {Hive.time_format})"
-    return f"FROM_UNIXTIME({_str_to_unix(self, expression)})"
+    this = self.sql(expression, "this")
+    time_format = self.format_time(expression)
+    if time_format not in (Hive.time_format, Hive.date_format):
+        this = f"FROM_UNIXTIME(UNIX_TIMESTAMP({this}, {time_format}))"
+    return f"CAST({this} AS TIMESTAMP)"
 
 
 def _time_format(self, expression):
@@ -108,9 +86,15 @@ def _time_format(self, expression):
 def _time_to_str(self, expression):
     this = self.sql(expression, "this")
     time_format = self.format_time(expression)
-    if time_format == Hive.date_format:
-        return f"TO_DATE({this})"
     return f"DATE_FORMAT({this}, {time_format})"
+
+
+def _to_date_sql(self, expression):
+    this = self.sql(expression, "this")
+    time_format = self.format_time(expression)
+    if time_format and time_format not in (Hive.time_format, Hive.date_format):
+        return f"TO_DATE({this}, {time_format})"
+    return f"TO_DATE({this})"
 
 
 def _unnest_to_explode_sql(self, expression):
@@ -132,13 +116,18 @@ def _unnest_to_explode_sql(self, expression):
     return self.join_sql(expression)
 
 
+def _index_sql(self, expression):
+    this = self.sql(expression, "this")
+    table = self.sql(expression, "table")
+    columns = self.sql(expression, "columns")
+    return f"{this} ON TABLE {table} {columns}"
+
+
 class HiveMap(exp.Map):
     is_var_len_args = True
 
 
 class Hive(Dialect):
-    identifier = "`"
-    escape = "\\"
     alias_post_tablesample = True
 
     time_mapping = {
@@ -171,7 +160,8 @@ class Hive(Dialect):
 
     class Tokenizer(Tokenizer):
         QUOTES = ["'", '"']
-
+        IDENTIFIERS = ["`"]
+        ESCAPE = "\\"
         ENCODE = "utf-8"
 
         NUMERIC_LITERALS = {
@@ -227,19 +217,30 @@ class Hive(Dialect):
             "COLLECT_SET": exp.SetAgg.from_arg_list,
             "SIZE": exp.ArraySize.from_arg_list,
             "SPLIT": exp.RegexpSplit.from_arg_list,
-            "TO_DATE": exp.TsOrDsToDateStr.from_arg_list,
+            "TO_DATE": format_time_lambda(exp.TsOrDsToDate, "hive"),
             "UNIX_TIMESTAMP": format_time_lambda(exp.StrToUnix, "hive", True),
             "YEAR": lambda args: exp.Year(this=exp.TsOrDsToDate.from_arg_list(args)),
         }
 
     class Generator(Generator):
+        ROOT_PROPERTIES = [
+            exp.PartitionedByProperty,
+            exp.FileFormatProperty,
+            exp.SchemaCommentProperty,
+            exp.LocationProperty,
+            exp.TableFormatProperty,
+        ]
+        WITH_PROPERTIES = [exp.AnonymousProperty]
+
         TYPE_MAPPING = {
+            **Generator.TYPE_MAPPING,
             exp.DataType.Type.TEXT: "STRING",
-            exp.DataType.Type.VARCHAR: "STRING",
         }
 
         TRANSFORMS = {
             **Generator.TRANSFORMS,
+            **transforms.UNALIAS_GROUP,
+            exp.AnonymousProperty: _property_sql,
             exp.ApproxDistinct: approx_count_distinct_sql,
             exp.ArrayAgg: rename_func("COLLECT_LIST"),
             exp.ArraySize: rename_func("SIZE"),
@@ -248,40 +249,56 @@ class Hive(Dialect):
             exp.DateAdd: lambda self, e: f"DATE_ADD({self.sql(e, 'this')}, {self.sql(e, 'expression')})",
             exp.DateDiff: lambda self, e: f"DATEDIFF({self.sql(e, 'this')}, {self.sql(e, 'expression')})",
             exp.DateStrToDate: rename_func("TO_DATE"),
-            exp.DateToDateStr: lambda self, e: f"DATE_FORMAT({self.sql(e, 'this')}, {Hive.date_format})",
             exp.DateToDi: lambda self, e: f"CAST(DATE_FORMAT({self.sql(e, 'this')}, {Hive.dateint_format}) AS INT)",
             exp.DiToDate: lambda self, e: f"TO_DATE(CAST({self.sql(e, 'this')} AS STRING), {Hive.dateint_format})",
-            exp.Properties: _properties_sql,
-            exp.Property: _property_sql,
+            exp.FileFormatProperty: lambda self, e: f"STORED AS {e.text('value').upper()}",
             exp.If: if_sql,
+            exp.Index: _index_sql,
             exp.ILike: no_ilike_sql,
             exp.Join: _unnest_to_explode_sql,
             exp.JSONExtract: rename_func("GET_JSON_OBJECT"),
             exp.JSONExtractScalar: rename_func("GET_JSON_OBJECT"),
             exp.Map: _map_sql,
             HiveMap: _map_sql,
+            exp.PartitionedByProperty: lambda self, e: f"PARTITIONED BY {self.sql(e.args['value'])}",
             exp.Quantile: rename_func("PERCENTILE"),
             exp.RegexpLike: lambda self, e: self.binary(e, "RLIKE"),
             exp.RegexpSplit: rename_func("SPLIT"),
             exp.SafeDivide: no_safe_divide_sql,
+            exp.SchemaCommentProperty: lambda self, e: f"COMMENT {self.sql(e.args['value'])}",
             exp.SetAgg: rename_func("COLLECT_SET"),
             exp.Split: lambda self, e: f"SPLIT({self.sql(e, 'this')}, CONCAT('\\\\Q', {self.sql(e, 'expression')}))",
             exp.StrPosition: lambda self, e: f"LOCATE({csv(self.sql(e, 'substr'), self.sql(e, 'this'), self.sql(e, 'position'))})",
+            exp.StrToDate: _str_to_date,
             exp.StrToTime: _str_to_time,
             exp.StrToUnix: _str_to_unix,
             exp.StructExtract: struct_extract_sql,
+            exp.TableFormatProperty: lambda self, e: f"USING {self.sql(e, 'value')}",
             exp.TimeStrToDate: rename_func("TO_DATE"),
             exp.TimeStrToTime: lambda self, e: f"CAST({self.sql(e, 'this')} AS TIMESTAMP)",
             exp.TimeStrToUnix: rename_func("UNIX_TIMESTAMP"),
             exp.TimeToStr: _time_to_str,
-            exp.TimeToTimeStr: lambda self, e: f"CAST({self.sql(e, 'this')} AS STRING)",
             exp.TimeToUnix: rename_func("UNIX_TIMESTAMP"),
             exp.TsOrDiToDi: lambda self, e: f"CAST(SUBSTR(REPLACE(CAST({self.sql(e, 'this')} AS STRING), '-', ''), 1, 8) AS INT)",
             exp.TsOrDsAdd: lambda self, e: f"DATE_ADD({self.sql(e, 'this')}, {self.sql(e, 'expression')})",
-            exp.TsOrDsToDateStr: rename_func("TO_DATE"),
-            exp.TsOrDsToDate: rename_func("TO_DATE"),
+            exp.TsOrDsToDate: _to_date_sql,
             exp.TryCast: no_trycast_sql,
             exp.UnixToStr: lambda self, e: f"FROM_UNIXTIME({csv(self.sql(e, 'this'), _time_format(self, e))})",
             exp.UnixToTime: rename_func("FROM_UNIXTIME"),
             exp.UnixToTimeStr: rename_func("FROM_UNIXTIME"),
         }
+
+        def with_properties(self, properties):
+            return self.properties(
+                properties,
+                prefix="TBLPROPERTIES",
+            )
+
+        def datatype_sql(self, expression):
+            if (
+                expression.this
+                in (exp.DataType.Type.VARCHAR, exp.DataType.Type.NVARCHAR)
+                and not expression.expressions
+            ):
+                expression = exp.DataType.build("text")
+            return super().datatype_sql(expression)
